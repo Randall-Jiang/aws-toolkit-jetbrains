@@ -14,65 +14,47 @@ import com.intellij.execution.ui.ConsoleViewContentType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
+import com.intellij.openapi.util.io.FileUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.ui.content.impl.ContentImpl
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.controller.CodeTestChatHelper
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.BuildAndExecuteStatusIcon
-import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.getBuildIcon
-import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.getExecutionIcon
-import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.getFixingTestCasesIcon
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildAndExecuteProgressStatus
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildAndExecuteTaskContext
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildStatus
 import java.io.File
 import java.io.FileWriter
 
-fun constructBuildAndExecutionSummaryText(currentStatus: BuildAndExecuteProgressStatus, iterationNum: Int): String {
+fun constructBuildAndExecutionSummaryText(currentStatus: BuildAndExecuteProgressStatus, codeTestChatHelper: CodeTestChatHelper): String {
     val progressMessages = mutableListOf<String>()
-
-    if (currentStatus >= BuildAndExecuteProgressStatus.RUN_BUILD) {
-        val verb = when (currentStatus) {
-            BuildAndExecuteProgressStatus.RUN_BUILD -> "in progress"
-            BuildAndExecuteProgressStatus.BUILD_FAILED -> "failed"
-            else -> "complete"
-        }
-        progressMessages.add("${getBuildIcon(currentStatus)}: Project compiled $verb")
+    if (currentStatus == BuildAndExecuteProgressStatus.RUN_BUILD) {
+        progressMessages.add("${BuildAndExecuteStatusIcon.WAIT.icon} ${"Project compiling\n"}")
     }
 
-    if (currentStatus >= BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS) {
-        val verb = if (currentStatus == BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS) "Executing" else "Executed"
-        progressMessages.add("${getExecutionIcon(currentStatus)}: $verb Ran tests")
+    if (currentStatus == BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS && codeTestChatHelper.getActiveSession().buildStatus == BuildStatus.FAILURE) {
+        progressMessages.add("${BuildAndExecuteStatusIcon.WAIT.icon} ${"Fixing test failures\n"}")
     }
 
-    if (currentStatus >= BuildAndExecuteProgressStatus.FIXING_TEST_CASES || currentStatus == BuildAndExecuteProgressStatus.BUILD_FAILED) {
-        val verb = if (currentStatus == BuildAndExecuteProgressStatus.FIXING_TEST_CASES) "Fixing" else "Fixed"
-        progressMessages.add("${getFixingTestCasesIcon(currentStatus)}: $verb errors in tests")
+    if (currentStatus > BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS && codeTestChatHelper.getActiveSession().buildStatus == BuildStatus.FAILURE) {
+        progressMessages.add("${BuildAndExecuteStatusIcon.DONE.icon} ${"Fixed test failures\n"}")
     }
 
-    if (currentStatus >= BuildAndExecuteProgressStatus.PROCESS_TEST_RESULTS) {
+    if (currentStatus >= BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS && codeTestChatHelper.getActiveSession().buildStatus == BuildStatus.SUCCESS) {
+        progressMessages.add("${BuildAndExecuteStatusIcon.DONE.icon} ${"Project compiled"}")
+        progressMessages.add("${BuildAndExecuteStatusIcon.DONE.icon} ${"All tests passed\n"}")
+    }
+// TODO: Commenting out this code to do a better UX in the V2 version after science support
+    if (currentStatus >= BuildAndExecuteProgressStatus.FIXING_TEST_CASES && codeTestChatHelper.getActiveSession().buildStatus == BuildStatus.FAILURE) {
         progressMessages.add("\n")
-        progressMessages.add("**Test case summary**")
+        progressMessages.add("**Results**")
         progressMessages.add("\n")
-        progressMessages.add(BuildAndExecuteStatusIcon.DONE.icon + "Build Success")
-        progressMessages.add(BuildAndExecuteStatusIcon.DONE.icon + "Assertion Success")
+        progressMessages.add("Amazon Q executed the tests and identified at least one failure. Below are the suggested fixes.")
     }
-
-    val prefix =
-        if (iterationNum < 2) {
-            "Sure"
-        } else {
-            val timeString = when (iterationNum) {
-                2 -> "second"
-                3 -> "third"
-                4 -> "fourth"
-                // shouldn't reach
-                else -> "fifth"
-            }
-            "Working on the $timeString iteration now"
-        }
 
     // Join all progress messages into a single string
     return """
-            $prefix. This may take a few minutes and I'll update the progress here.
+            Sure, This may take a few minutes and I'll update the progress here.
         
             **Progress summary**
             
@@ -86,6 +68,7 @@ fun runBuildOrTestCommand(
     isBuildCommand: Boolean,
     buildAndExecuteTaskContext: BuildAndExecuteTaskContext,
     testFileRelativePathToProjectRoot: String,
+    codeTestChatHelper: CodeTestChatHelper,
 ) {
     val brazilPath = "${System.getProperty("user.home")}/.toolbox/bin:/usr/local/bin:/usr/bin:/bin:/sbin"
     if (localCommand.isEmpty()) {
@@ -99,32 +82,44 @@ fun runBuildOrTestCommand(
     // Find the nearest Gradle root directory
     var packageRoot: File? = testFileAbsolutePath.parentFile
     var foundGradleRoot = false
-    while (packageRoot != null && packageRoot != projectRoot) {
+    while (packageRoot != null && !FileUtil.filesEqual(packageRoot, projectRoot)) {
         if (File(packageRoot, "settings.gradle.kts").exists() || File(packageRoot, "build.gradle.kts").exists() ||
             File(packageRoot, "settings.gradle").exists() || File(packageRoot, "build.gradle").exists()
         ) {
             foundGradleRoot = true
-            break// Store the last valid Gradle root found
+            break // Store the last valid Gradle root found
         }
         packageRoot = packageRoot.parentFile
     }
-    var workingDir = if(foundGradleRoot){
+    val workingDir = if (foundGradleRoot) {
         packageRoot ?: testFileAbsolutePath.parentFile
-    }else {
+    } else {
         testFileAbsolutePath.parentFile
     }
 
-
-    // If no valid Gradle directory is found, fallback to the project root
-    val gradleWrapper = File(packageRoot ?: projectRoot, "gradlew")
     val console: ConsoleView = ConsoleViewImpl(project, true)
 
     // Attach Console View to Build Tool Window
     ApplicationManager.getApplication().invokeLater {
         val tabName = if (isBuildCommand) "Q TestGen Build Output" else "Q Test Gen Test Execution Output"
+
+        // Get the BuildContentManager instance
+        val buildContentManager = BuildContentManager.getInstance(project)
+
+        val toolWindow = buildContentManager.getOrCreateToolWindow()
+        val contentManager = toolWindow.contentManager
+
+        // Check if tab already exists
+        val existingContent = contentManager.contents.find { it.displayName == tabName }
+
+        if (existingContent != null) {
+            // If tab exists, remove it
+            buildContentManager.removeContent(existingContent)
+        }
+        // Create and add new content
         val content = ContentImpl(console.component, tabName, true)
-        BuildContentManager.getInstance(project).addContent(content)
-        BuildContentManager.getInstance(project).setSelectedContent(content, false, false, true, null)
+        buildContentManager.addContent(content)
+        buildContentManager.setSelectedContent(content, false, false, true, null)
     }
 
     val commandLine = when {
@@ -137,7 +132,6 @@ fun runBuildOrTestCommand(
     }.withWorkDirectory(workingDir)
 
     try {
-        // val process = processBuilder.start()
         val processHandler = OSProcessHandler(commandLine)
 
         // Attach Process Listener for Output Handling
@@ -151,15 +145,24 @@ fun runBuildOrTestCommand(
                 ApplicationManager.getApplication().invokeLater {
                     VirtualFileManager.getInstance().refreshAndFindFileByNioPath(file.toPath())?.refresh(false, false)
                 }
+                // Check if the build has been cancelled
+                if (codeTestChatHelper.getActiveSession().buildStatus == BuildStatus.CANCELLED) {
+                    processHandler.destroyProcess()
+                    console.print("\nBuild cancelled by user\n", ConsoleViewContentType.ERROR_OUTPUT)
+                    if (isBuildCommand) {
+                        buildAndExecuteTaskContext.buildExitCode = 1
+                    } else {
+                        buildAndExecuteTaskContext.testExitCode = 1
+                    }
+                }
             }
-
             override fun processTerminated(event: ProcessEvent) {
                 val exitCode = event.exitCode
                 if (exitCode == 0) {
-                    // green color
+                    codeTestChatHelper.getActiveSession().buildStatus = BuildStatus.SUCCESS
                     console.print("\nBUILD SUCCESSFUL\n", ConsoleViewContentType.USER_INPUT)
-                } else {
-                    // red color
+                } else if (codeTestChatHelper.getActiveSession().buildStatus != BuildStatus.CANCELLED) {
+                    codeTestChatHelper.getActiveSession().buildStatus = BuildStatus.FAILURE
                     console.print("\nBUILD FAILED with exit code $exitCode\n", ConsoleViewContentType.ERROR_OUTPUT)
                 }
                 if (isBuildCommand) {

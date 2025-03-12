@@ -61,15 +61,19 @@ import software.aws.toolkits.jetbrains.services.amazonqCodeTest.CodeWhispererUTG
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.ConversationState
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.FEATURE_NAME
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.InboundAppMessagesHandler
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.cancellingProgressField
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.createProgressField
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.messages.Button
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.messages.CodeTestChatMessage
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.messages.CodeTestChatMessageContent
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.messages.IncomingCodeTestMessage
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.PreviousUTGIterationContext
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildAndExecuteProgressStatus
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildStatus
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.Session
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.UTG_CHAT_MAX_ITERATION
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.storage.ChatSessionStorage
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.testGenCompletedField
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.utils.constructBuildAndExecutionSummaryText
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.utils.runBuildOrTestCommand
 import software.aws.toolkits.jetbrains.services.amazonqFeatureDev.messages.sendAuthNeededException
@@ -100,6 +104,7 @@ import software.aws.toolkits.telemetry.AmazonqTelemetry
 import software.aws.toolkits.telemetry.FeatureId
 import software.aws.toolkits.telemetry.InteractionType
 import software.aws.toolkits.telemetry.MetricResult
+import software.aws.toolkits.telemetry.Status
 import software.aws.toolkits.telemetry.UiTelemetry
 import java.io.File
 import java.nio.file.Files
@@ -116,7 +121,6 @@ class CodeTestChatController(
     private val authController: AuthController = AuthController(),
     private val cs: CoroutineScope,
 ) : InboundAppMessagesHandler {
-    var buildResult = false
     val messenger = context.messagesFromAppToUi
     private val codeTestChatHelper = CodeTestChatHelper(context.messagesFromAppToUi, chatSessionStorage)
     private val supportedLanguage = setOf("python", "java")
@@ -170,6 +174,7 @@ class CodeTestChatController(
     override suspend fun processStartTestGen(message: IncomingCodeTestMessage.StartTestGen) {
         codeTestChatHelper.setActiveCodeTestTabId(message.tabId)
         val session = codeTestChatHelper.getActiveSession()
+        sessionCleanUp(message.tabId)
         // check if IDE has active file open, yes return (fileName and filePath) else return null
         val project = context.project
         val fileInfo = checkActiveFileInIDE(project, message) ?: return
@@ -178,13 +183,6 @@ class CodeTestChatController(
             return
         }
         session.startTimeOfTestGeneration = Instant.now().toEpochMilli().toDouble()
-        session.isGeneratingTests = true
-
-        var requestId: String = ""
-        var statusCode: Int = 0
-        var conversationId: String? = null
-        var testResponseMessageId: String? = null
-        var testResponseText: String = ""
 
         val userMessage = when {
             message.prompt != "" -> {
@@ -220,6 +218,11 @@ class CodeTestChatController(
             CodeWhispererUTGChatManager.getInstance(project).generateTests(userPrompt, codeTestChatHelper, null, selectionRange)
         } else {
             // Not adding a progress bar to unsupported language cases
+            var requestId: String = ""
+            var statusCode: Int = 0
+            var conversationId: String? = null
+            var testResponseMessageId: String? = null
+            var testResponseText: String = ""
             val responseHandler = GenerateAssistantResponseResponseHandler.builder()
                 .onResponse {
                     requestId = it.responseMetadata().requestId()
@@ -313,7 +316,8 @@ class CodeTestChatController(
                     credentialStartUrl = getStartUrl(project),
                     result = MetricResult.Succeeded,
                     perfClientLatency = (Instant.now().toEpochMilli() - session.startTimeOfTestGeneration),
-                    requestId = id
+                    requestId = id,
+                    status = Status.ACCEPTED
                 )
             }
             session.isGeneratingTests = false
@@ -566,7 +570,13 @@ class CodeTestChatController(
                     session.linesOfCodeGenerated = lineDifference.coerceAtLeast(0)
                     session.charsOfCodeGenerated = charDifference.coerceAtLeast(0)
                     session.latencyOfTestGeneration = (Instant.now().toEpochMilli() - session.startTimeOfTestGeneration)
-                    UiTelemetry.click(null as Project?, "unitTestGeneration_viewDiff")
+                    UiTelemetry.click(
+                        context.project,
+                        when (session.listOfTestGenerationJobId.size) {
+                            1 -> "unitTestGeneration_viewDiff"
+                            else -> "unitTestGeneration_viewDiff_Iteration"
+                        }
+                    )
 
                     val buttonList = mutableListOf<Button>()
                     buttonList.add(
@@ -578,21 +588,6 @@ class CodeTestChatController(
                             status = "error",
                         ),
                     )
-                    /*
-                    // TODO: for unit test regeneration loop
-                    if (session.iteration < 2) {
-                        buttonList.add(
-                            Button(
-                                "utg_regenerate",
-                                "Regenerate",
-                                keepCardAfterClick = true,
-                                position = "outside",
-                                status = "info",
-                            ),
-                        )
-                    }
-                     */
-
                     buttonList.add(
                         Button(
                             "utg_accept",
@@ -648,26 +643,32 @@ class CodeTestChatController(
                         }
                     }
                 }
-                val testGenerationEventResponse = client.sendTestGenerationEvent(
-                    session.testGenerationJob,
-                    session.testGenerationJobGroupName,
-                    session.programmingLanguage,
-                    IdeCategory.JETBRAINS,
-                    session.numberOfUnitTestCasesGenerated,
-                    session.numberOfUnitTestCasesGenerated,
-                    session.linesOfCodeGenerated,
-                    session.linesOfCodeGenerated,
-                    session.charsOfCodeGenerated,
-                    session.charsOfCodeGenerated
+
+                UiTelemetry.click(
+                    context.project,
+                    when (session.listOfTestGenerationJobId.size) {
+                        1 -> "unitTestGeneration_acceptDiff"
+                        else -> "unitTestGeneration_acceptDiff_Iteration"
+                    }
                 )
-                LOG.debug {
-                    "Successfully sent test generation telemetry. RequestId: ${
-                        testGenerationEventResponse.responseMetadata().requestId()}"
-                }
 
-                UiTelemetry.click(null as Project?, "unitTestGeneration_acceptDiff")
-
-                if (session.iteration == 1) {
+                if (session.listOfTestGenerationJobId.size == 1) {
+                    val testGenerationEventResponse = client.sendTestGenerationEvent(
+                        session.testGenerationJob,
+                        session.testGenerationJobGroupName,
+                        session.programmingLanguage,
+                        IdeCategory.JETBRAINS,
+                        session.numberOfUnitTestCasesGenerated,
+                        session.numberOfUnitTestCasesGenerated,
+                        session.linesOfCodeGenerated,
+                        session.linesOfCodeGenerated,
+                        session.charsOfCodeGenerated,
+                        session.charsOfCodeGenerated
+                    )
+                    LOG.debug {
+                        "Successfully sent test generation telemetry. RequestId: ${
+                            testGenerationEventResponse.responseMetadata().requestId()}"
+                    }
                     AmazonqTelemetry.utgGenerateTests(
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
@@ -688,29 +689,25 @@ class CodeTestChatController(
                         artifactsUploadDuration = session.artifactUploadDuration,
                         buildPayloadBytes = session.srcPayloadSize,
                         buildZipFileBytes = session.srcZipFileSize,
-                        requestId = session.startTestGenerationRequestId
+                        requestId = session.startTestGenerationRequestId,
+                        status = Status.ACCEPTED
                     )
                 }
 
-                codeTestChatHelper.addAnswer(
-                    CodeTestChatMessageContent(
-                        message = message("testgen.message.success"),
-                        type = ChatMessageType.Answer,
-                        canBeVoted = false
-                    )
-                )
                 if (!isInternalUser) {
+                    codeTestChatHelper.addAnswer(
+                        CodeTestChatMessageContent(
+                            message = message("testgen.message.success"),
+                            type = ChatMessageType.Answer,
+                            canBeVoted = false
+                        )
+                    )
                     sessionCleanUp(message.tabId)
                     return
                 }
 
-                codeTestChatHelper.updateUI(
-                    promptInputDisabledState = false,
-                    promptInputPlaceholder = message("testgen.placeholder.enter_slash_quick_actions"),
-                )
-
                 val taskContext = session.buildAndExecuteTaskContext
-                if (session.iteration < 2) {
+                if (session.listOfTestGenerationJobId.size < 2) {
                     taskContext.buildCommand = codeTestChatHelper.getSession(message.tabId).shortAnswer.buildCommand.toString()
 
                     codeTestChatHelper.addAnswer(
@@ -751,10 +748,11 @@ class CodeTestChatController(
                     )
                     codeTestChatHelper.updateUI(
                         promptInputDisabledState = true,
+                        promptInputPlaceholder = message("testgen.placeholder.select_an_action_to_proceed"),
                     )
-                } else if (session.iteration < 4) {
+                } else if (session.listOfTestGenerationJobId.size < 4) {
                     // Already built and executed once, display # of iterations left message
-                    val remainingIterationsCount = UTG_CHAT_MAX_ITERATION - session.iteration
+                    val remainingIterationsCount = UTG_CHAT_MAX_ITERATION - session.listOfTestGenerationJobId.size
                     val iterationCountString = "$remainingIterationsCount ${if (remainingIterationsCount > 1) "iterations" else "iteration"}"
                     codeTestChatHelper.addAnswer(
                         CodeTestChatMessageContent(
@@ -785,6 +783,7 @@ class CodeTestChatController(
                     )
                     codeTestChatHelper.updateUI(
                         promptInputDisabledState = true,
+                        promptInputPlaceholder = message("testgen.placeholder.waiting_on_your_inputs"),
                     )
                 } else {
                     // TODO: change this hardcoded string
@@ -800,7 +799,7 @@ class CodeTestChatController(
                         promptInputPlaceholder = message("testgen.placeholder.newtab")
                     )
                     AmazonqTelemetry.unitTestGeneration(
-                        count = session.iteration.toLong() - 1,
+                        count = session.listOfTestGenerationJobId.size.toLong() - 1,
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
                         isSupportedLanguage = true,
@@ -820,6 +819,7 @@ class CodeTestChatController(
                         buildZipFileBytes = session.srcZipFileSize,
                         requestId = session.startTestGenerationRequestId,
                         update = session.updateBuildCommands,
+                        status = Status.ACCEPTED
                     )
                 }
             }
@@ -886,9 +886,14 @@ class CodeTestChatController(
                     "Successfully sent test generation telemetry. RequestId: ${
                         testGenerationEventResponse.responseMetadata().requestId()}"
                 }
-
-                UiTelemetry.click(null as Project?, "unitTestGeneration_rejectDiff")
-                if (session.iteration == 1) {
+                UiTelemetry.click(
+                    context.project,
+                    when (session.listOfTestGenerationJobId.size) {
+                        1 -> "unitTestGeneration_rejectDiff"
+                        else -> "unitTestGeneration_rejectDiff_Iteration"
+                    }
+                )
+                if (session.listOfTestGenerationJobId.size == 1) {
                     AmazonqTelemetry.utgGenerateTests(
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
@@ -909,11 +914,12 @@ class CodeTestChatController(
                         artifactsUploadDuration = session.artifactUploadDuration,
                         buildPayloadBytes = session.srcPayloadSize,
                         buildZipFileBytes = session.srcZipFileSize,
-                        requestId = session.startTestGenerationRequestId
+                        requestId = session.startTestGenerationRequestId,
+                        status = Status.REJECTED
                     )
                 } else {
                     AmazonqTelemetry.unitTestGeneration(
-                        count = session.iteration.toLong() - 1,
+                        count = session.listOfTestGenerationJobId.size.toLong() - 1,
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
                         isSupportedLanguage = true,
@@ -926,7 +932,11 @@ class CodeTestChatController(
                         generatedLinesCount = session.linesOfCodeGenerated?.toLong(),
                         acceptedCharactersCount = 0,
                         generatedCharactersCount = session.charsOfCodeGenerated?.toLong(),
-                        result = MetricResult.Succeeded,
+                        result = when (session.buildStatus) {
+                            BuildStatus.SUCCESS -> MetricResult.Succeeded
+                            BuildStatus.FAILURE -> MetricResult.Failed
+                            else -> MetricResult.Cancelled
+                        },
                         perfClientLatency = session.latencyOfTestGeneration,
                         isCodeBlockSelected = session.isCodeBlockSelected,
                         artifactsUploadDuration = session.artifactUploadDuration,
@@ -947,7 +957,7 @@ class CodeTestChatController(
                     )
                 )
                 AmazonqTelemetry.unitTestGeneration(
-                    count = session.iteration.toLong() - 1,
+                    count = session.listOfTestGenerationJobId.size.toLong() - 1,
                     cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                     hasUserPromptSupplied = session.hasUserPromptSupplied,
                     isSupportedLanguage = true,
@@ -960,7 +970,11 @@ class CodeTestChatController(
                     generatedLinesCount = session.linesOfCodeGenerated?.toLong(),
                     acceptedCharactersCount = session.charsOfCodeGenerated?.toLong(),
                     generatedCharactersCount = session.charsOfCodeGenerated?.toLong(),
-                    result = MetricResult.Failed,
+                    result = when (session.buildStatus) {
+                        BuildStatus.SUCCESS -> MetricResult.Succeeded
+                        BuildStatus.FAILURE -> MetricResult.Failed
+                        else -> MetricResult.Cancelled
+                    },
                     perfClientLatency = session.latencyOfTestGeneration,
                     isCodeBlockSelected = session.isCodeBlockSelected,
                     artifactsUploadDuration = session.artifactUploadDuration,
@@ -974,20 +988,22 @@ class CodeTestChatController(
                 // handle both "Proceed" and "Build and execute" button clicks since their actions are similar
                 // TODO: show install dependencies card if needed
                 session.conversationState = ConversationState.IN_PROGRESS
+                codeTestChatHelper.updateUI(
+                    promptInputDisabledState = true,
+                    promptInputProgress = createProgressField("testgen.progressbar.build_and_execute")
+                )
 
                 // display build in progress card
                 val taskContext = session.buildAndExecuteTaskContext
 
                 taskContext.progressStatus = BuildAndExecuteProgressStatus.RUN_BUILD
-                val messageId = updateBuildAndExecuteProgressCard(taskContext.progressStatus, null, session.iteration)
-                // TODO: build and execute case
+                val messageId = updateBuildAndExecuteProgressCard(taskContext.progressStatus, null)
                 val buildLogsFile = VirtualFileManager.getInstance().findFileByNioPath(
                     withContext(currentCoroutineContext()) {
                         Files.createTempFile(null, null)
                     }
                 )
                 if (buildLogsFile == null) {
-                    // TODO: handle no log file case
                     return
                 }
                 LOG.debug {
@@ -1001,8 +1017,12 @@ class CodeTestChatController(
                     context.project,
                     isBuildCommand = true,
                     taskContext,
-                    session.testFileRelativePathToProjectRoot
+                    session.testFileRelativePathToProjectRoot,
+                    codeTestChatHelper
                 )
+                if (session.buildStatus === BuildStatus.CANCELLED) {
+                    return
+                }
                 while (taskContext.buildExitCode < 0) {
                     // wait until build command finished
                     delay(1000)
@@ -1010,7 +1030,7 @@ class CodeTestChatController(
 
                 if (taskContext.buildExitCode == 0) {
                     taskContext.progressStatus = BuildAndExecuteProgressStatus.PROCESS_TEST_RESULTS
-                    updateBuildAndExecuteProgressCard(taskContext.progressStatus, messageId, session.iteration)
+                    updateBuildAndExecuteProgressCard(taskContext.progressStatus, messageId)
                     codeTestChatHelper.addAnswer(
                         CodeTestChatMessageContent(
                             message = message("testgen.message.success"),
@@ -1018,8 +1038,13 @@ class CodeTestChatController(
                             canBeVoted = false
                         )
                     )
+                    codeTestChatHelper.updateUI(
+                        promptInputProgress = testGenCompletedField,
+                    )
+                    delay(1000)
+                    codeTestChatHelper.sendUpdatePromptProgress(session.tabId, null)
                     AmazonqTelemetry.unitTestGeneration(
-                        count = session.iteration.toLong() - 1,
+                        count = session.listOfTestGenerationJobId.size.toLong() - 1,
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
                         isSupportedLanguage = true,
@@ -1039,6 +1064,7 @@ class CodeTestChatController(
                         buildZipFileBytes = session.srcZipFileSize,
                         requestId = session.startTestGenerationRequestId,
                         update = session.updateBuildCommands,
+                        status = Status.ACCEPTED
                     )
                     sessionCleanUp(message.tabId)
                     return
@@ -1049,14 +1075,9 @@ class CodeTestChatController(
                     // handle build failure case
 
                     taskContext.progressStatus = BuildAndExecuteProgressStatus.BUILD_FAILED
-                    updateBuildAndExecuteProgressCard(taskContext.progressStatus, messageId, session.iteration)
-                    taskContext.progressStatus = BuildAndExecuteProgressStatus.FIXING_TEST_CASES
-                    val buildAndExecuteMessageId = updateBuildAndExecuteProgressCard(
-                        taskContext.progressStatus,
-                        messageId,
-                        session.iteration + 1
-                    )
-
+                    updateBuildAndExecuteProgressCard(taskContext.progressStatus, messageId)
+                    taskContext.progressStatus = BuildAndExecuteProgressStatus.RUN_EXECUTION_TESTS
+                    val buildAndExecuteMessageId = updateBuildAndExecuteProgressCard(taskContext.progressStatus, messageId)
                     val previousUTGIterationContext = PreviousUTGIterationContext(
                         buildLogFile = buildLogsFile,
                         testLogFile = null,
@@ -1071,10 +1092,8 @@ class CodeTestChatController(
                         context.project
                     ).generateTests(session.userPrompt, codeTestChatHelper, previousUTGIterationContext, null)
                     job?.join()
-
                     return
                 }
-                // TO-DO ADD execute loop in the furture
             }
             "utg_modify_command" -> {
                 // TODO allow user input to modify the command
@@ -1089,15 +1108,61 @@ class CodeTestChatController(
                         canBeVoted = false
                     )
                 )
+                codeTestChatHelper.updateUI(
+                    promptInputDisabledState = false,
+                    promptInputPlaceholder = message("testgen.placeholder.modifyCommand"),
+                )
+
                 session.conversationState = ConversationState.WAITING_FOR_BUILD_COMMAND_INPUT
             }
             "utg_install_and_continue" -> {
                 // TODO: install dependencies and build
             }
             "stop_test_generation" -> {
-                UiTelemetry.click(null as Project?, "unitTestGeneration_cancelTestGenerationProgress")
+                UiTelemetry.click(context.project, "unitTestGeneration_cancelTestGenerationProgress")
                 session.isGeneratingTests = false
-                sessionCleanUp(message.tabId)
+                return
+            }
+            "stop_test_gen_build_and_execution" -> {
+                UiTelemetry.click(context.project, "unitTestGeneration_cancelBuildProgress")
+                session.buildStatus = BuildStatus.CANCELLED
+                session.isGeneratingTests = false
+                AmazonqTelemetry.unitTestGeneration(
+                    cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
+                    hasUserPromptSupplied = session.hasUserPromptSupplied,
+                    isSupportedLanguage = true,
+                    credentialStartUrl = getStartUrl(project = context.project),
+                    jobGroup = session.testGenerationJobGroupName,
+                    jobId = session.testGenerationJob,
+                    result = MetricResult.Cancelled,
+                    reason = null,
+                    reasonDesc = null,
+                    perfClientLatency = (Instant.now().toEpochMilli() - session.startTimeOfTestGeneration),
+                    isCodeBlockSelected = session.isCodeBlockSelected,
+                    artifactsUploadDuration = session.artifactUploadDuration,
+                    buildZipFileBytes = session.srcZipFileSize,
+                    requestId = session.startTestGenerationRequestId,
+                    status = Status.CANCELLED,
+                )
+                codeTestChatHelper.updateUI(
+                    promptInputDisabledState = false,
+                    promptInputProgress = cancellingProgressField,
+                    promptInputPlaceholder = message("testgen.placeholder.enter_slash_quick_actions"),
+                )
+                delay(1000)
+                codeTestChatHelper.addAnswer(
+                    CodeTestChatMessageContent(
+                        message = message("testgen.message.cancelled"),
+                        type = ChatMessageType.Answer,
+                        canBeVoted = false
+                    )
+                )
+                codeTestChatHelper.sendUpdatePromptProgress(session.tabId, null)
+                return
+            }
+            "stop_fixing_test_cases" -> {
+                UiTelemetry.click(context.project, "unitTestGeneration_cancelFixingTest")
+                session.isGeneratingTests = false
                 return
             }
             else -> {
@@ -1117,9 +1182,8 @@ class CodeTestChatController(
     private suspend fun updateBuildAndExecuteProgressCard(
         currentStatus: BuildAndExecuteProgressStatus,
         messageId: String?,
-        iterationNum: Int,
     ): String? {
-        val updatedText = constructBuildAndExecutionSummaryText(currentStatus, iterationNum)
+        val updatedText = constructBuildAndExecutionSummaryText(currentStatus, codeTestChatHelper)
 
         if (currentStatus == BuildAndExecuteProgressStatus.RUN_BUILD) {
             val buildAndExecuteMessageId = codeTestChatHelper.addAnswer(

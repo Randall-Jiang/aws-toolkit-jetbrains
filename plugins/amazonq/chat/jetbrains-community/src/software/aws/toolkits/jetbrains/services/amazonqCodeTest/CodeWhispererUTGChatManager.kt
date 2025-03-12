@@ -36,7 +36,9 @@ import software.aws.toolkits.jetbrains.services.amazonqCodeTest.messages.CodeTes
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.PreviousUTGIterationContext
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.model.ShortAnswer
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildAndExecuteProgressStatus
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.BuildStatus
 import software.aws.toolkits.jetbrains.services.amazonqCodeTest.session.Session
+import software.aws.toolkits.jetbrains.services.amazonqCodeTest.utils.constructBuildAndExecutionSummaryText
 import software.aws.toolkits.jetbrains.services.codemodernizer.utils.calculateTotalLatency
 import software.aws.toolkits.jetbrains.services.codewhisperer.codetest.CodeTestException
 import software.aws.toolkits.jetbrains.services.codewhisperer.codetest.fileTooLarge
@@ -54,6 +56,7 @@ import software.aws.toolkits.jetbrains.utils.isQConnected
 import software.aws.toolkits.resources.message
 import software.aws.toolkits.telemetry.AmazonqTelemetry
 import software.aws.toolkits.telemetry.MetricResult
+import software.aws.toolkits.telemetry.Status
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -87,26 +90,16 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
     ) {
         // 1st API call: Zip project and call CreateUploadUrl
         val session = codeTestChatHelper.getActiveSession()
-        session.isGeneratingTests = true
-        session.iteration++
-        if (session.testGenerationJobGroupName.isNullOrEmpty()) {
+        if (session.testGenerationJobGroupName.isEmpty()) {
             session.testGenerationJobGroupName = UUID.randomUUID().toString()
         }
-        val final = session.testGenerationJobGroupName
 
-        if (session.iteration == 1) {
-            codeTestChatHelper.updateUI(
-                promptInputDisabledState = true,
-                promptInputProgress = testGenProgressField(0),
-            )
-        } else {
-            codeTestChatHelper.updateUI(
-                promptInputDisabledState = true,
-                promptInputProgress = buildAndExecuteProgrogressField,
-            )
-        }
-
-        // Set the Progress bar to "Generating unit tests..."
+        codeTestChatHelper.updateUI(
+            promptInputDisabledState = true,
+            promptInputProgress = session.listOfTestGenerationJobId.takeUnless { it.isEmpty() }
+                ?.let { fixingTestCasesProgressField }
+                ?: testGenProgressField(0)
+        )
 
         val codeTestResponseContext = createUploadUrl(codeTestChatHelper, previousIterationContext)
         session.srcPayloadSize = codeTestResponseContext.payloadContext.srcPayloadSize
@@ -117,7 +110,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
             fileTooLarge()
         }
 
-        val createUploadUrlResponse = codeTestResponseContext.createUploadUrlResponse ?: return
+        val createUploadUrlResponse = codeTestResponseContext.createUploadUrlResponse
         throwIfCancelled(session)
 
         LOG.debug {
@@ -150,7 +143,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                                 .build()
                         ),
                         userInput = prompt,
-                        testGenerationJobGroupName = final
+                        testGenerationJobGroupName = session.testGenerationJobGroupName
                     )
                     delay(200)
                     response?.testGenerationJob() != null
@@ -179,11 +172,12 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
         session.startTestGenerationRequestId = startTestGenerationResponse.responseMetadata().requestId()
         session.testGenerationJobGroupName = job.testGenerationJobGroupName()
         session.testGenerationJob = job.testGenerationJobId()
+        session.listOfTestGenerationJobId += job.testGenerationJobId()
         throwIfCancelled(session)
 
         // 3rd API call: Step 3:  Polling mechanism on test job status with getTestGenStatus getTestGeneration
         var finished = false
-        var testGenerationResponse: GetTestGenerationResponse? = null
+        var testGenerationResponse: GetTestGenerationResponse?
 
         var shortAnswer = ShortAnswer()
         LOG.debug {
@@ -275,14 +269,13 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                 }
                 codeTestChatHelper.updateUI(
                     promptInputDisabledState = true,
-                    promptInputProgress = if (session.iteration == 1) {
-                        testGenProgressField(0)
-                    } else {
-                        buildAndExecuteProgrogressField
+                    promptInputProgress = when (session.listOfTestGenerationJobId.size) {
+                        1 -> testGenProgressField(progressRate)
+                        else -> createProgressField("testgen.progressbar.fixing_test_cases")
                     }
                 )
             }
-
+            throwIfCancelled(session)
             // polling every 2 seconds to reduce # of API calls
             delay(2000)
         }
@@ -309,10 +302,10 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                 LOG.info { "ExportResultArchive latency: ${calculateTotalLatency(startTime, Instant.now())}" }
             }
         )
+        throwIfCancelled(session)
         val result = byteArray.reduce { acc, next -> acc + next } // To map the result it is needed to combine the  full byte array
         storeGeneratedTestDiffs(result, session)
         if (!session.isGeneratingTests) {
-            // TODO: Modify text according to FnF
             codeTestChatHelper.addAnswer(
                 CodeTestChatMessageContent(
                     message = message("testgen.error.generic_technical_error_message"),
@@ -342,6 +335,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                 )
             )
         } else {
+            throwIfCancelled(session)
             if (previousIterationContext == null) {
                 // show another card as the answer
                 val viewDiffMessageId = codeTestChatHelper.addAnswer(
@@ -360,17 +354,18 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                 session.viewDiffMessageId = viewDiffMessageId
                 codeTestChatHelper.updateUI(
                     promptInputDisabledState = false,
-                    promptInputPlaceholder = "Specify a function(s) in the current file(optional)",
                     promptInputProgress = testGenCompletedField,
                 )
             } else {
+                val updatedText = constructBuildAndExecutionSummaryText(BuildAndExecuteProgressStatus.PROCESS_TEST_RESULTS, codeTestChatHelper)
                 codeTestChatHelper.updateAnswer(
                     CodeTestChatMessageContent(
                         type = ChatMessageType.Answer,
                         buttons = listOf(Button("utg_view_diff", "View Diff", keepCardAfterClick = true, position = "outside", status = "info")),
                         fileList = listOf(getTestFilePathRelativeToRoot(shortAnswer)),
                         projectRootName = project.name,
-                        codeReference = codeReference
+                        codeReference = codeReference,
+                        message = updatedText
                     ),
                     messageIdOverride = previousIterationContext.buildAndExecuteMessageId
                 )
@@ -384,6 +379,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                 promptInputPlaceholder = message("testgen.placeholder.view_diff"),
                 promptInputProgress = testGenCompletedField,
             )
+            throwIfCancelled(session)
             delay(1000)
         }
 
@@ -486,10 +482,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
             } else {
                 previousIterationContext.selectedFile
             }
-
-        val combinedBuildAndExecuteLogFile =
-            previousIterationContext?.buildLogFile
-        val codeTestSessionConfig = CodeTestSessionConfig(file, project, combinedBuildAndExecuteLogFile)
+        val codeTestSessionConfig = CodeTestSessionConfig(file, project, previousIterationContext?.buildLogFile)
         codeTestChatHelper.getActiveSession().projectRoot = codeTestSessionConfig.projectRoot.path
 
         val codeTestSessionContext = CodeTestSessionContext(project, codeTestSessionConfig)
@@ -560,7 +553,10 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
             session.conversationState = ConversationState.IDLE
             return null
         }
-
+        if (session.buildStatus === BuildStatus.CANCELLED) {
+            session.conversationState = ConversationState.IDLE
+            return null
+        }
         beforeTestGenFlow(session)
 
         return cs.launch {
@@ -587,7 +583,7 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                         canBeVoted = false
                     )
                 )
-                if (session.iteration == 1) {
+                if (session.listOfTestGenerationJobId.size < 2) {
                     AmazonqTelemetry.utgGenerateTests(
                         cwsprChatProgrammingLanguage = session.programmingLanguage.languageId,
                         hasUserPromptSupplied = session.hasUserPromptSupplied,
@@ -621,13 +617,14 @@ class CodeWhispererUTGChatManager(val project: Project, private val cs: Coroutin
                         isCodeBlockSelected = session.isCodeBlockSelected,
                         artifactsUploadDuration = session.artifactUploadDuration,
                         buildZipFileBytes = session.srcZipFileSize,
-                        requestId = session.startTestGenerationRequestId
+                        requestId = session.startTestGenerationRequestId,
+                        status = if (e.message == message("testgen.message.cancelled")) Status.CANCELLED else Status.FAILED,
                     )
                 }
-
                 session.isGeneratingTests = false
             } finally {
                 // Reset the flow if there is any error
+                codeTestChatHelper.sendUpdatePromptProgress(session.tabId, null)
                 if (!session.isGeneratingTests) {
                     codeTestChatHelper.updateUI(
                         promptInputProgress = cancellingProgressField
